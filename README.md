@@ -2,14 +2,6 @@
 
 Maintain dns records for connecting openvpn clients
 
-# Features
-
-- generate PTR/AAAA/A records using `common_name` of the client certifcate
-  and both internal or external ip addresses using `nsupdate`
-- support for private key
-- supports multiple forward and reverse zones and
-  pick the first matching ip address or `common_name`
-
 # Usage
 
 The following text assumes, that an openvpn server with client certificates,
@@ -59,32 +51,12 @@ the configuration takes the following following keys:
   - example: `hmac-sha512:ddns-key NTc1ODVmNDk5NzgwMDgyODQ2ZTAzMGNlZmI0YTkwN2M5ZTg1MzNiN2UxMWQyNjZhNjg2YWQ1MDc4Y2NlZjU0Mw==`
 - **reverse_zones**
   - array
-  - optional
-  - list of reverse zones, which are matched against public/private openvpn client ip.
-    If the ip is contained in one of the provided reverse zones, 
-    the PTR records will be updated using the common_name as value.
-- **private_zones**:
+  - required
+  - list of reverse zones to add a PTR recored in
+- **zones**:
   - array
-  - optional
-  - list of zones, which are matched against the common_name field of the client certificate.
-    If one zone is a suffix of the common_name, 
-    a A or AAAA records are updated using the internal ip address as value.
-- **private_search_domain**
-  - string
-  - optional
-  - if set and non of the private zones matched, openvpn-ddns will fallback to this domain.
-    The record will be build from the host part of `common_name`.
-- **public_zones**:
-  - array
-  - optional
-  - list of zones, which are matched against the common_name field of the client certificate.
-    If one zone is a suffix of the common_name, 
-    a A or AAAA records are updated using the public ip address asvalue.
-- **public_search_domain**
-  - string
-  - optional
-  - if set and non of the public zones matched, openvpn-ddns will fallback to this domain.
-    The record will be build from the host part of `common_name`.
+  - required
+  - list of zones, you want the comon name to be added in
 
 A dnssec-key can be obtained like this:
 
@@ -98,11 +70,19 @@ key "openvpn" {
 
 4. Run openvpn
 
-Add the following lines to you openvpn server configuration.
+For adding/removing clients, add this to the server config
 
 ```
 learn-address /etc/openvpn/ddns/openvpn-ddns
 script-security 2
 ```
+
+For adding the ip of the server itself:
+```
+up /etc/openvpn/ddns/openvpn-ddns
+script-security 2
+```
+
+Down is not supported, as it's unlikely that a vpn server is removed entirely...
 
 At the moment only `tun` mode of openvpn is supported.
