@@ -3,30 +3,38 @@
 require 'json'
 require 'tempfile'
 require 'ipaddr'
+require 'socket'
 
 ##
 # Configuration
 ##
 class Configuration
+  attr_reader :name_server, :private_key, :nsupdate_executable, :zones,
+              :v4_reverse_zones, :v6_reverse_zones
+
   def initialize(config_file)
+    config = load_config(config_file)
+    @name_server           = assert_type(config, 'name_server', String, true)
+    @private_key           = assert_type(config, 'private_key', String)
+    @zones                 = assert_type(config, 'zones', Array, true)
+    reverse_zones          = assert_type(config, 'reverse_zones', Array, true)
+    @nsupdate_executable   = assert_type(config, 'nsupdate_executable', String)
+    set_reverse_zones(reverse_zones)
+  end
+
+  def load_config(config_file)
     begin
       json = JSON.load(File.open(config_file))
     rescue => e
       abort "Failed to load configuration: #{e}"
     end
     abort 'configuration is empty' if json.nil? || json == ''
-    data = json['nsupdate'] or abort "no 'nsupdate' object found in configuration"
-    abort "'nsupdate' should be an object" unless data.is_a? Hash
-    @name_server           = assert_type(data, 'name_server', String) or
-      abort "no 'name_server' specified in configuration"
-    @private_key           = assert_type(data, 'private_key', String)
-    @public_zones          = assert_type(data, 'public_zones', Array) || []
-    @private_zones         = assert_type(data, 'private_zones', Array) || []
-    @public_search_domain  = assert_type(data, 'public_search_domain', String)
-    @private_search_domain = assert_type(data, 'private_search_domain', String)
-    reverse_zones          = assert_type(data, 'reverse_zones', Array) || []
-    @nsupdate_executable   = assert_type(data, 'nsupdate_executable', String)
+    config = json['nsupdate'] or abort "no 'nsupdate' object found in configuration"
+    abort "'nsupdate' should be an object" unless config.is_a? Hash
+    config
+  end
 
+  def set_reverse_zones(reverse_zones)
     @v4_reverse_zones = []
     @v6_reverse_zones = []
 
@@ -41,89 +49,58 @@ class Configuration
     end
   end
 
-  def assert_type(data, key, type)
-    val = data[key]
+  def assert_type(config, key, type, required = false)
+    val = config[key]
     unless val.nil? || val.is_a?(type)
       abort "key '#{key}' should be an #{type.to_s.downcase}"
     end
+    if required
+      abort "'#{key}' is required, but is empty" if val.nil?
+      abort "'#{key}' is required, but is empty" if val.length == 0
+    end
     val
   end
-  attr_reader :name_server,
-              :private_key,
-              :nsupdate_executable,
-              :private_zones,
-              :public_zones,
-              :private_search_domain,
-              :public_search_domain,
-              :v4_reverse_zones,
-              :v6_reverse_zones
 end
 
 ##
 # Nsupdate
 ##
-
 class Nsupdate
   def initialize(config)
     @config = config
   end
 
-  def remove_record(private_ip, public_ip, common_name)
-    change_record(private_ip, public_ip, common_name, false)
+  def remove_record(ip, common_name)
+    change_record(ip, common_name, false)
   end
 
-  def add_record(private_ip, public_ip, common_name)
-    change_record(private_ip, public_ip, common_name, true)
+  def add_record(ip, common_name)
+    change_record(ip, common_name, true)
   end
 
   private
 
-  def change_record(private_ip, public_ip, common_name, add)
+  def change_record(ip, common_name, add)
     transaction = []
 
-    transaction += forward_entry(private_ip,
-                                 common_name,
-                                 @config.private_zones,
-                                 @config.private_search_domain,
-                                 add)
-    transaction += reverse_entry(private_ip, common_name, add)
+    transaction += forward_entry(ip, common_name, @config.zones, add)
+    transaction += reverse_entry(ip, common_name, add)
 
-    if public_ip
-      transaction += forward_entry(public_ip,
-                                   common_name,
-                                   @config.public_zones,
-                                   @config.public_search_domain,
-                                   add)
-      transaction += reverse_entry(public_ip, common_name, add)
-    end
-
-    private_key = if @config.private_key
-                    ["key #{@config.private_key}"]
-                  else
-                    []
-                  end
+    private_key = @config.private_key ? ["key #{@config.private_key}"] : []
 
     return if transaction.empty?
 
-    nsupdate(
-      ["server #{@config.name_server}"] +
-      private_key +
-      transaction +
-      ['quit']
-    )
+    perform(["server #{@config.name_server}"] + private_key + transaction + ['quit'])
   end
 
-  def forward_entry(ip, common_name, zones, search_domain, add)
+  def forward_entry(ip, common_name, zones, add)
     transaction = []
 
-    zone, domain = find_zone(common_name, zones, search_domain)
-
-    unless zone.nil?
+    zones.each do |zone|
+      next if zone.nil?
       transaction << "zone #{zone}"
-      transaction << "update delete #{domain}. #{rtype(ip)}"
-      if add
-        transaction << "update add #{domain}. 3600 #{rtype(ip)} #{ip.to_string}"
-      end
+      transaction << "update delete #{common_name}.#{zone}. #{rtype(ip)}"
+      transaction << "update add #{common_name}.#{zone}. 3600 #{rtype(ip)} #{ip.to_string}" if add
       transaction << 'send'
     end
     transaction
@@ -132,66 +109,36 @@ class Nsupdate
   def reverse_entry(ip, common_name, add)
     transaction = []
 
-    reverse_zone = find_reverse_zone(ip)
-    unless reverse_zone.nil?
-      transaction << "zone #{reverse_zone}"
+    r_zones = ip.ipv4? ? @config.v4_reverse_zones : @config.v6_reverse_zones
+
+    r_zones.each do |r_zone|
+      next if r_zone.nil?
+      transaction << "zone #{r_zone}"
       transaction << "update delete #{ip.reverse}. PTR"
-      if add
-        transaction << "update add #{ip.reverse}. 3600 PTR #{common_name}"
-      end
+      transaction << "update add #{ip.reverse}. 3600 PTR #{common_name}" if add
       transaction << 'send'
     end
     transaction
   end
 
-  def find_reverse_zone(ip)
-    reverse_zones = if ip.ipv4?
-                      @config.v4_reverse_zones
-                    else
-                      @config.v6_reverse_zones
-                    end
-
-    reverse_zones.each do |zone|
-      return zone if ip.reverse.end_with?(zone)
-    end
-    nil
-  end
-
-  def find_zone(name, zones, search_domain)
-    name = normalize(name)
-    zones.each do |zone|
-      zone = normalize(zone)
-      return zone, name if name.end_with?(zone)
-    end
-    unless search_domain.nil?
-      zone = normalize(search_domain)
-      hostpart = name[/^[^.]+/]
-      return zone, "#{hostpart}.#{zone}"
-    end
-    nil
-  end
-
-  def normalize(s)
-    # remove leading/trailing dots
-    # remove characters not allowed in fqdn
-    s.gsub(/^\.|\.$|[^a-zA-Z0-9\-.]+/, "")
-  end
+  # def normalize(s)
+  #   # remove leading/trailing dots
+  #   # remove characters not allowed in fqdn
+  #   s.gsub(/^\.|\.$|[^a-zA-Z0-9\-.]+/, '')
+  # end
 
   def rtype(ip)
-    if ip.ipv6?
-      'AAAA'
-    else
-      'A'
-    end
+    ip.ipv4? ? 'A' : 'AAAA'
   end
 
-  def nsupdate(zone)
+  def perform(transaction)
     cmd = [@config.nsupdate_executable || 'nsupdate']
     puts("$ #{cmd.join(' ')} <<'EOF'")
-    puts(zone.join("\n"))
+    puts(transaction.join("\n"))
     puts("'EOF'")
+    return # Debug until ready
     IO.popen(cmd, 'r+') do |io|
-      io.write(zone.join("\n"))
+      io.write(transaction.join("\n"))
       io.close_write
       puts(io.read)
     end
@@ -234,23 +181,35 @@ def main
   config_file = find_config
   config = Configuration.new(config_file)
 
-  abort "USAGE: #{$PROGRAM_NAME} (add|update|delete) ADDRESS CN" if ARGV.size < 3
+  if ARGV.size > 3
+    abort "USAGE: #{$PROGRAM_NAME} TUN_DEV TUN_MTU LINK_MTU ADDRESS REMOTE_ADDRESS (init | restart) see up command in openvpn docs" if ARGV.size < 6
+    # For up command
+    # cmd tun_dev tun_mtu link_mtu ifconfig_local_ip ifconfig_remote_ip [ init | restart ]
+    #        0       1        2           3                 4                  5
+    if ARGV[5] == 'restart'
+      operation = 'update'
+    else
+      operation = 'add'
+    end
+    cn = Socket.gethostname
+    address = ARGV[3]
+  else
+    abort "USAGE: #{$PROGRAM_NAME} (add|update|delete) ADDRESS CN" if ARGV.size < 3
+    operation, address, cn = ARGV
+  end
 
-  operation, address, cn = ARGV
   begin
-    private_ip = IPAddr.new(address).native
+    ip = IPAddr.new(address).native
   rescue IPAddr::InvalidAddressError => e
     abort "error parsing address '#{address}': #{e}"
   end
-  public_ip = ENV['trusted_ip'] || ENV['trusted_ip6']
-  public_ip = IPAddr.new(public_ip).native if public_ip
 
   nsupdate = Nsupdate.new(config)
   case operation
   when 'add', 'update'
-    nsupdate.add_record(private_ip, public_ip, cn)
+    nsupdate.add_record(ip, cn)
   when 'delete'
-    nsupdate.remove_record(private_ip, public_ip, cn)
+    nsupdate.remove_record(ip, cn)
   else
     abort "unknown operation #{operation}"
   end
